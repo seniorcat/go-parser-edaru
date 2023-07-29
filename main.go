@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gocolly/colly"
 	"go.uber.org/zap"
@@ -15,8 +17,51 @@ type Category struct {
 	ParentSlug string
 }
 
-func main() {
+type Recept struct {
+	ID             int    `db:"id"`
+	Name           string `db:"name"`
+	CookingTime    string `db:"cooking_time"`
+	Description    string `db:"description"`
+	NumberServings string `db:"number_servings"`
+	ImageSrc       string `db:"image_src"`
+	Image          string `db:"image"`
+	Href           string
+	CategorySlug   string
+}
 
+func main() {
+	// инициализируем логер для девелопмент среды
+	logger, _ := zap.NewDevelopment()
+	// запускаем парсинг категорий и присваиваем переменной categoryList результат в виде массива категорий
+	categoryList := GetCategoryList(logger)
+
+	// перебираем все категории
+	for _, category := range categoryList {
+		// получаем список рецептов категории
+		recepties, err := GetRecepeList(category.Href, category.Slug, logger)
+
+		// при возникновении ошибки, выводим в консоль
+		if err != nil {
+			logger.Error(err.Error())
+		}
+
+		// перебираем список рецептов
+		for _, v := range recepties {
+			// проходим по каждому рецепту и заходя на страницу парсим данные рецепта
+			if err := GetRecepe(v, logger); err != nil {
+				logger.Error(err.Error())
+			}
+		}
+
+		// выводим полученные рецепты
+		for _, r := range recepties {
+			fmt.Println(r)
+		}
+
+	}
+}
+
+func GetCategoryList(logger *zap.Logger) []*Category {
 	// создаем массив категорий в который будем складывать все что спарсили с сайта
 	listCategory := []*Category{}
 
@@ -83,7 +128,7 @@ func main() {
 	c.Visit("https://eda.ru")
 
 	// инициализируем логер для продакшн среды
-	logger, _ := zap.NewProduction()
+
 	// выводим общее количество категорий которые удалось найти на странице
 	logger.Info("Категории получены", zap.Int("количество", len(listCategory)))
 
@@ -97,4 +142,140 @@ func main() {
 			fmt.Println(" - " + c.Name)
 		}
 	}
+
+	return listCategory
+}
+
+func GetRecepeList(urlCategory string, slugCategory string, logger *zap.Logger) ([]*Recept, error) {
+	logger.Info(
+		"Scraper: Получение списка ссылок на рецепты...",
+	)
+	// объявляем необходимые переменные
+	var (
+		count    = 0
+		allCount = 0
+		first    = true
+		baseURL  = "https://eda.ru"
+		c        = initColly()
+		list     = []*Recept{}
+	)
+
+	// Ищем все элементы с указанным классом
+	c.OnHTML(".emotion-1jdotsv", func(h *colly.HTMLElement) {
+		// если это первый элемент, считываем содержимое и выводим в консоль (количество рецептов в категории)
+		if first {
+			allCountString := h.Text
+			listStr := []string{
+				"Найдено ",
+				"Найден ",
+				"Найдены ",
+				" рецепта",
+				" рецептов",
+				" рецепт",
+			}
+			for _, v := range listStr {
+				allCountString = strings.ReplaceAll(allCountString, v, "")
+			}
+			allCount, _ = strconv.Atoi(allCountString)
+
+			first = false
+			logger.Info(
+				"Scraper: Всего рецептов по категории",
+				zap.String("Категория", slugCategory),
+				zap.Int("Всего", allCount),
+			)
+		}
+	})
+
+	// Ищем все элементы с указанным классом
+	c.OnHTML(".emotion-1eugp2w", func(h *colly.HTMLElement) {
+		recipeLink := h.ChildAttrs("a", "href")
+
+		if recipeLink == nil {
+			return
+		}
+		// добавляем рецепт в массив
+		list = append(list, &Recept{Href: recipeLink[0], CategorySlug: slugCategory})
+
+		count++
+	})
+
+	c.Visit(baseURL + urlCategory)
+
+	lastCount := 0
+	// если общее количество рецептов больше количества которое уже обработано, начинаем перебирать страницы
+	if count < allCount {
+		logger.Debug("Scraper: На первой странице не все рецепты")
+
+		for i := 2; lastCount != count; i++ {
+			lastCount = count
+
+			// добавляем к ссылке параметр страницы
+			url := fmt.Sprintf("%s?page=%s", baseURL+urlCategory, strconv.Itoa(i))
+
+			logger.Info(
+				"Scraper: Получение рецептов...",
+				zap.Int("Получено", count),
+				zap.Int("Всего", allCount),
+				zap.String("Категория", slugCategory),
+			)
+			logger.Debug("Scraper: Парсинг", zap.Int("страница", i))
+
+			c.Visit(url)
+		}
+	}
+	logger.Info(
+		"Scraper: Получено рецептов",
+		zap.Int("Получено", count),
+		zap.Int("Всего", allCount),
+		zap.String("Категория", slugCategory),
+	)
+
+	// возвращаем массив рецептов
+	return list, nil
+}
+
+func GetRecepe(recept *Recept, logger *zap.Logger) error {
+	// объявляем необходимые переменные
+	var (
+		ss      = strings.Split(recept.Href, "-")
+		id, _   = strconv.Atoi(ss[len(ss)-1])
+		baseURL = "https://eda.ru"
+		c       = initColly()
+	)
+	recept.ID = id
+
+	// парсим картинку рецепта
+	c.OnHTML("span[itemprop=resultPhoto]", func(h *colly.HTMLElement) {
+		recept.ImageSrc = h.Attr("content")
+
+	})
+	// парсим название, время приготовления и количество порций
+	c.OnHTML(".emotion-19rdt1j", func(h *colly.HTMLElement) {
+		recept.Name = h.ChildText("h1")
+		recept.CookingTime = h.ChildText(".emotion-my9yfq")
+		recept.NumberServings = h.ChildText("span[itemprop=recipeYield]")
+
+	})
+
+	// парсим описание
+	c.OnHTML(".emotion-aiknw3", func(h *colly.HTMLElement) {
+		recept.Description = h.Text
+
+	})
+
+	c.Visit(baseURL + recept.Href)
+
+	return nil
+}
+
+func initColly() *colly.Collector {
+
+	// инициализируем новый коллектор с задержкой в 3 секунды чтобы не перегрузить сайт парсингом и не вызвать особых подозрений
+	c := colly.NewCollector(colly.AllowedDomains("eda.ru"))
+	c.Limit(&colly.LimitRule{
+		DomainGlob: "eda.ru",
+		Delay:      3 * time.Second,
+	})
+	return c
 }
